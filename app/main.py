@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.core.database import engine
 from app.models import Base
+from app.api.routes import router
 
 app = FastAPI(title="URL Shortener API")
 
@@ -11,6 +12,8 @@ async def init_db():
     """
     async with engine.begin() as conn: 
         await conn.run_sync(Base.metadata.create_all) # 
+
+app.include_router(router)
 
 @app.get("/health")
 async def health_check():
