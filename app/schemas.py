@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl, Field, field_validator, ConfigDict
+from pydantic import BaseModel, HttpUrl, Field, field_validator, ConfigDict, EmailStr
 from uuid import UUID
 from datetime import datetime, timezone
 
@@ -26,11 +26,24 @@ class LinkCreate(BaseModel):
             raise ValueError("expires_at must be in the future")
         return value 
 
-
+    
 class LinkResponse(BaseModel):
     id: UUID
     short_code: str
     long_url: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=72)
+
+
+class UserResponse(BaseModel):
+    id: UUID
+    email: EmailStr
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
