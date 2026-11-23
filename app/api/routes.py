@@ -22,6 +22,7 @@ from app.core.database import get_db
 from app.models import Link, User
 from app.core.security import hash_password, verify_password, create_access_token
 from app.core.config import settings
+from app.core.redis import redis_client
 
 # creating the router
 router = APIRouter()
@@ -46,9 +47,9 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: An
     )
     try:
         user_id = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]).get("sub", None)
-        if user_id is None:
+        if user_id is None: # if there is no sub key
             raise credentials_exception
-    except InvalidTokenError:
+    except InvalidTokenError: # user has no token (Not logged in)
         raise credentials_exception
     
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
@@ -110,22 +111,34 @@ async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)
         user searches /code on main server and app looks it up in the database,
         and redirects user to the original link
     """
-    result = await db.execute(select(Link).where(Link.short_code == code))
-    link = result.scalar_one_or_none()
+    # first checking if the link exists in cache memory
+    cached_url = await redis_client.get(code)
+    time_to_live = 3600 # default
 
-    # check if link exists
-    if not link:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Link not found"
-        )
+    if cached_url is None: # code has not been stored in the cache memory
+        result = await db.execute(select(Link).where(Link.short_code == code))
+        link = result.scalar_one_or_none()
+        if not link:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Link not found"
+            )
 
-    # check if link as expired
-    if link.expires_at and link.expires_at <= datetime.now(timezone.utc):
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="This link has expired"
+        if link.expires_at and link.expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Link has expired"
+            )
 
+        if link.expires_at:
+            seconds_left = int((link.expires_at - datetime.now(timezone.utc)).total_seconds())
+            time_to_live = min(time_to_live, seconds_left)
+        await redis_client.set(code, link.long_url, ex=time_to_live)
+
+    else:
+        return RedirectResponse(
+            url=cached_url,
+            status_code=status.HTTP_307_TEMPORARY_REDIRECT
         )
 
     return RedirectResponse(
