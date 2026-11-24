@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from fastapi import BackgroundTasks
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from typing import Annotated
+import json
 import logging
 import secrets
 import string
@@ -20,7 +22,8 @@ from jwt.exceptions import InvalidTokenError
 
 from app.schemas import LinkCreate, LinkResponse, UserCreate, UserResponse
 from app.core.database import get_db
-from app.models import Link, User
+from app.core.database import SessionLocal
+from app.models import Link, User, Click
 from app.core.security import hash_password, verify_password, create_access_token
 from app.core.config import settings
 from app.core.redis import redis_client
@@ -41,8 +44,9 @@ def generate_short_code(length: int = 6) -> str:
     alphabets = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabets) for _ in range(length))
 
-# creating a get user function for authorization
+
 async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: Annotated[AsyncSession, Depends(get_db)]):
+    """creating a get user function for authorization"""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could Not Validate Credentials"
@@ -60,8 +64,9 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: An
         raise credentials_exception
     return user
 
-# creating the rate limit check
+
 async def rate_limiting_check(current_user: Annotated[User, Depends(get_current_user)]) -> bool:
+    """creating the rate limit check"""
     key = f"rate_limit:user:{current_user.id}"
     now = datetime.now(timezone.utc).timestamp()
     window_start = now - 60
@@ -81,7 +86,21 @@ async def rate_limiting_check(current_user: Annotated[User, Depends(get_current_
 
     return True
 
-    
+async def track_click(link_id: uuid.UUID, country: str, device: str):
+    """tracks click details as user clicks on a link"""
+    try:
+        async with SessionLocal() as db:
+            new_click = Click(
+                link_id=link_id,
+                country=country,
+                device=device
+            )
+            db.add(new_click)
+            await db.commit()
+    except Exception as e:
+        logger.exception(f"Could not add click for link: {link_id}. {e}")
+            
+        
 # first route
 @router.post("/links", response_model=LinkResponse, status_code=status.HTTP_201_CREATED)
 async def create_link(link_data: LinkCreate, db: Annotated[AsyncSession, Depends(get_db)], 
@@ -131,7 +150,7 @@ async def create_link(link_data: LinkCreate, db: Annotated[AsyncSession, Depends
 
 
 @router.get("/{code}")
-async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)]):
+async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)], background_task: BackgroundTasks):
     """
         user searches /code on main server and app looks it up in the database,
         and redirects user to the original link
@@ -141,40 +160,50 @@ async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)
     time_to_live = 3600 # default
 
     try:
-        cached_url = await redis_client.get(cache_key)
+        cached_link_str = await redis_client.get(cache_key)
     except RedisError:
-        logger.exception("Redis is down during cache read")
-        cached_url = None
-   
-    if cached_url is None: # code has not been stored in the cache memory
-        result = await db.execute(select(Link).where(Link.short_code == code))
-        link = result.scalar_one_or_none()
-        if not link:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Link not found"
-            )
+        logger.exception("redis down during read")
+        cached_link_str = None
 
-        if link.expires_at and link.expires_at <= datetime.now(timezone.utc):
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail="Link has expired"
-            )
+    if cached_link_str:
+        cached_link_detail = json.loads(cached_link_str)
+        cached_url = cached_link_detail["long_url"]
+        cached_id = uuid.UUID(cached_link_detail["id"])
 
-        if link.expires_at:
-            seconds_left = int((link.expires_at - datetime.now(timezone.utc)).total_seconds())
-            time_to_live = min(time_to_live, seconds_left)
-        try:
-            await redis_client.set(cache_key, link.long_url, ex=time_to_live)
-        except RedisError:
-            logger.exception("redis is down during cache write")
-
-    else:
+        background_task.add_task(track_click, cached_id, country="Nigeria", device="Iphone")
         return RedirectResponse(
             url=cached_url,
             status_code=status.HTTP_307_TEMPORARY_REDIRECT
+        )     
+
+    # cache miss
+    result = await db.execute(select(Link).where(Link.short_code == code))
+    link = result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Link not found"
         )
 
+    if link.expires_at and link.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Link has expired"
+        )
+
+    if link.expires_at:
+        seconds_left = int((link.expires_at - datetime.now(timezone.utc)).total_seconds())
+        time_to_live = min(time_to_live, seconds_left)
+    try:
+        link_detail = json.dumps({
+            "id": str(link.id),
+            "long_url": link.long_url,
+        })
+        await redis_client.set(cache_key, link_detail, ex=time_to_live)
+    except RedisError:
+        logger.exception("redis is down during cache write")
+
+    background_task.add_task(track_click, link.id, country="Nigeria", device="Iphone")
     return RedirectResponse(
         url=link.long_url,
         status_code=status.HTTP_307_TEMPORARY_REDIRECT
