@@ -12,6 +12,7 @@ import secrets
 import string
 import uuid
 from datetime import datetime, timezone
+from redis.exceptions import RedisError
 
 from jose import jwt
 from jwt.exceptions import InvalidTokenError
@@ -23,6 +24,7 @@ from app.models import Link, User
 from app.core.security import hash_password, verify_password, create_access_token
 from app.core.config import settings
 from app.core.redis import redis_client
+
 
 # creating the router
 router = APIRouter()
@@ -58,10 +60,33 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: An
         raise credentials_exception
     return user
 
+# creating the rate limit check
+async def rate_limiting_check(current_user: Annotated[User, Depends(get_current_user)]) -> bool:
+    key = f"rate_limit:user:{current_user.id}"
+    now = datetime.now(timezone.utc).timestamp()
+    window_start = now - 60
+    limit = 5
+    # delete past requests all the way up to 60 seconds ago
+    await redis_client.zremrangebyscore(key, 0, window_start)
+    # how many requests for that user (for 60 seconds ago)
+    request_count = await redis_client.zcard(key)
 
+    if request_count >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests. Try again in 1 minute"
+        )
+    await redis_client.zadd(key, {str(uuid.uuid4()): now})
+    await redis_client.expire(key, 60)
+
+    return True
+
+    
 # first route
 @router.post("/links", response_model=LinkResponse, status_code=status.HTTP_201_CREATED)
-async def create_link(link_data: LinkCreate, db: Annotated[AsyncSession, Depends(get_db)], current_user: Annotated[User, Depends(get_current_user)]):
+async def create_link(link_data: LinkCreate, db: Annotated[AsyncSession, Depends(get_db)], 
+                      current_user: Annotated[User, Depends(get_current_user)],
+                      _: Annotated[bool, Depends(rate_limiting_check)]):
     """
     route in which user creates the link, before this function runs, pydantic must have checked validation
     """
@@ -112,9 +137,15 @@ async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)
         and redirects user to the original link
     """
     # first checking if the link exists in cache memory
-    cached_url = await redis_client.get(code)
+    cache_key = f"url_shortener_{code}"
     time_to_live = 3600 # default
 
+    try:
+        cached_url = await redis_client.get(cache_key)
+    except RedisError:
+        logger.exception("Redis is down during cache read")
+        cached_url = None
+   
     if cached_url is None: # code has not been stored in the cache memory
         result = await db.execute(select(Link).where(Link.short_code == code))
         link = result.scalar_one_or_none()
@@ -133,7 +164,10 @@ async def redirect_to_url(code: str, db: Annotated[AsyncSession, Depends(get_db)
         if link.expires_at:
             seconds_left = int((link.expires_at - datetime.now(timezone.utc)).total_seconds())
             time_to_live = min(time_to_live, seconds_left)
-        await redis_client.set(code, link.long_url, ex=time_to_live)
+        try:
+            await redis_client.set(cache_key, link.long_url, ex=time_to_live)
+        except RedisError:
+            logger.exception("redis is down during cache write")
 
     else:
         return RedirectResponse(
